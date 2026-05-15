@@ -147,6 +147,13 @@ client.on('interactionCreate', async (interaction) => {
         await User.findOneAndUpdate({ discordId: id }, { role: 'whitelist', addedBy: interaction.user.id }, { upsert: true });
         await interaction.reply({ content: `✅ 追加しました: ${id}`, ephemeral: true });
     }
+    if (interaction.isModalSubmit() && interaction.customId === 'modal_sysprompt') {
+        const newPrompt = interaction.fields.getTextInputValue('input_sysprompt');
+        const session = await getSession(interaction.user.id);
+        session.systemPrompt = newPrompt;
+        await saveUserSettings(interaction.user.id, session);
+        await interaction.reply({ content: '✅ システムプロンプトを更新しました。', ephemeral: true });
+    }
     if (interaction.isButton() || interaction.isStringSelectMenu()) await handleDashboardInteraction(interaction, role);
 });
 
@@ -221,14 +228,38 @@ async function handleDashboardInteraction(interaction, role) {
     } else if (cid === 'dash_clear') {
         session.history = [];
         await interaction.reply({ content: '🗑️ クリアしました。', ephemeral: true });
+    } else if (cid === 'dash_sysprompt') {
+        const modal = new ModalBuilder()
+            .setCustomId('modal_sysprompt')
+            .setTitle('システムプロンプト設定');
+        const input = new TextInputBuilder()
+            .setCustomId('input_sysprompt')
+            .setLabel('新しいシステムプロンプトを入力してください')
+            .setStyle(TextInputStyle.Paragraph)
+            .setValue(session.systemPrompt || '')
+            .setRequired(false);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
     }
 }
 
 async function showDashboard(ctx, userId, role, isSlash = false) {
     const session = await getSession(userId);
-    const embed = new EmbedBuilder().setTitle('📊 ダッシュボード').setColor(0x5865F2).addFields({ name: '🤖 モデル', value: getModelDisplay(session) });
+    const historyCount = session.history.filter(m => m.role === 'user' || m.role === 'assistant').length;
+    
+    const embed = new EmbedBuilder()
+        .setTitle('📊 コントロールパネル')
+        .setColor(0x5865F2)
+        .addFields(
+            { name: '🤖 現在のモデル', value: getModelDisplay(session), inline: true },
+            { name: '👤 権限', value: `\`${role.toUpperCase()}\``, inline: true },
+            { name: '💬 会話履歴', value: `\`${historyCount} 件\` のメッセージ`, inline: true },
+            { name: '🎭 システムプロンプト', value: session.systemPrompt ? `\`\`\`text\n${session.systemPrompt.length > 50 ? session.systemPrompt.substring(0, 50) + '...' : session.systemPrompt}\n\`\`\`` : '`デフォルト設定`' }
+        );
+        
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('dash_model_change').setLabel('モデル変更').setStyle(ButtonStyle.Primary).setDisabled(role === 'regular'),
+        new ButtonBuilder().setCustomId('dash_sysprompt').setLabel('プロンプト変更').setStyle(ButtonStyle.Secondary).setDisabled(role === 'regular'),
         new ButtonBuilder().setCustomId('dash_clear').setLabel('履歴クリア').setStyle(ButtonStyle.Danger)
     );
     await ctx.reply({ embeds: [embed], components: [row] });
