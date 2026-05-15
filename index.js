@@ -16,6 +16,7 @@ const {
     TextInputStyle,
     AttachmentBuilder,
 } = require('discord.js');
+const cheerio = require('cheerio');
 
 const AIClient = require('./src/aiClient');
 const { MODELS, DEFAULT_MODEL, DEFAULT_SYSTEM_PROMPT } = require('./src/models');
@@ -44,7 +45,7 @@ const ai = new AIClient({
 });
 
 const sessions = new Map();
-const MAX_HISTORY = 30;
+const MAX_HISTORY_TOKENS = 2500;
 
 async function getSession(userId) {
     if (!sessions.has(userId)) {
@@ -246,13 +247,60 @@ async function showWhitelistDashboard(ctx, page = 0, isSlash = false, isUpdate =
 }
 
 // ── AIチャット処理 ──
+async function extractWebContent(text) {
+    if (!text) return text;
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+    const urls = text.match(urlRegex);
+    if (!urls) return text;
+
+    let augmentedText = text;
+    for (const url of urls) {
+        try {
+            const res = await fetch(url);
+            const html = await res.text();
+            const $ = cheerio.load(html);
+            $('script, style, noscript, iframe, img, svg, video').remove();
+            let pageText = $('body').text().replace(/\s+/g, ' ').trim();
+            if (pageText.length > 2000) pageText = pageText.substring(0, 2000) + '...';
+            augmentedText += `\n\n[Web Reference: ${url}]\n${pageText}`;
+        } catch (e) {
+            console.error(`URL fetch error ${url}:`, e);
+        }
+    }
+    return augmentedText;
+}
+
+function trimHistoryByTokens(history, maxTokens) {
+    let currentTokens = 0;
+    const trimmed = [];
+    for (let i = history.length - 1; i >= 0; i--) {
+        const msg = history[i];
+        let msgTokens = 0;
+        if (typeof msg.content === 'string') {
+            msgTokens = estimateTokens(msg.content);
+        } else if (Array.isArray(msg.content)) {
+            for (const part of msg.content) {
+                if (part.type === 'text') msgTokens += estimateTokens(part.text);
+                else msgTokens += 500; // rough image estimate
+            }
+        }
+        if (currentTokens + msgTokens > maxTokens) break;
+        currentTokens += msgTokens;
+        trimmed.unshift(msg);
+    }
+    return trimmed;
+}
+
 async function handleChat(message, userMessage) {
     const session = await getSession(message.author.id);
     await message.channel.sendTyping();
     const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
     try {
         const contentParts = [];
-        if (userMessage) contentParts.push({ type: 'text', text: userMessage });
+        if (userMessage) {
+            const augmentedMessage = await extractWebContent(userMessage);
+            contentParts.push({ type: 'text', text: augmentedMessage });
+        }
         if (message.attachments.size > 0) {
             for (const attachment of message.attachments.values()) {
                 const buffer = await (await fetch(attachment.url)).arrayBuffer();
@@ -260,7 +308,9 @@ async function handleChat(message, userMessage) {
             }
         }
         session.history.push({ role: 'user', content: contentParts.length === 1 && contentParts[0].type === 'text' ? contentParts[0].text : contentParts });
-        while (session.history.length > MAX_HISTORY) session.history.shift();
+        
+        session.history = trimHistoryByTokens(session.history, MAX_HISTORY_TOKENS);
+        
         const result = await ai.chat(session.model, session.history, session.systemPrompt, getProvider(session));
         session.history.push({ role: 'assistant', content: result.content });
         session.messageCount++;
